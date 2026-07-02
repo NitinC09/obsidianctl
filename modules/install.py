@@ -53,6 +53,123 @@ def _detect_chroot_cmd():
 _chroot = _detect_chroot_cmd()
 
 
+def _is_openrc_at(mount_dir):
+    """True if the rootfs at mount_dir uses OpenRC (openrc-init binary present)."""
+    return os.path.exists(f"{mount_dir}/sbin/openrc-init")
+
+
+def _with_temp_mount(part_path, mount_point, body, cleanup_dir=False):
+    """Mount part_path at mount_point, run body() with the mount in place, then unmount.
+
+    body is a callable that takes no arguments. Errors during body still trigger
+    cleanup. cleanup_dir=True removes the mount directory after unmount
+    (use for one-shot scratch dirs; leave False for dirs that should persist).
+    """
+    run_command(f"mkdir -p {mount_point}")
+    try:
+        run_command(f"mount {part_path} {mount_point}")
+        body()
+    finally:
+        run_command(f"umount {mount_point}", check=False)
+        if cleanup_dir:
+            run_command(f"rmdir {mount_point}", check=False)
+
+
+def _mount_slot_chroot(mount_dir, device, slot):
+    """Mount the 5-partition layout (root, ESP, etc_ab, var_ab, home_ab) for a slot.
+
+    slot is 'a' or 'b'. The caller is responsible for unmounting (usually
+    `umount -R {mount_dir}`).
+    """
+    root_label = f"root_{slot}"
+    esp_label = "ESP_A" if slot == "a" else "ESP_B"
+    mounts = [
+        f"mount {lordo(root_label, device)} {mount_dir}/",
+        f"mount {lordo(esp_label, device)} {mount_dir}/efi",
+        f"mount {lordo('etc_ab', device)} {mount_dir}/run/etc_ab --mkdir",
+        f"mount {lordo('var_ab', device)} {mount_dir}/var",
+        f"mount {lordo('home_ab', device)} {mount_dir}/home",
+    ]
+    for cmd in mounts:
+        run_command(cmd)
+
+
+def _write_fstab(path, device, fstype, slot):
+    """Write an fstab for the given slot ('a' or 'b') to path."""
+    root_label = f"root_{slot}"
+    esp_label = "ESP_A" if slot == "a" else "ESP_B"
+    content = f"""\
+{lordo(root_label, device)}  /             {fstype}  defaults,noatime 0 1
+{lordo(esp_label, device)}   /efi          vfat      defaults,noatime 0 2
+{lordo('etc_ab', device)}    /run/etc_ab   {fstype}  defaults,noatime 0 2
+{lordo('var_ab', device)}    /var          {fstype}  defaults,noatime 0 2
+{lordo('home_ab', device)}   /home         {fstype}  defaults,noatime 0 2
+"""
+    if not os.path.exists(os.path.dirname(path)):
+        run_command(f"mkdir -p {os.path.dirname(path)}")
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def _install_grub_to_slot(mount_dir, device, slot, use_grub2):
+    """Install GRUB to the given slot. Slot must be 'a' or 'b'.
+
+    Mounts the slot's partitions, runs grub-install + grub-mkconfig, unmounts.
+    Sets OpenRC kernel cmdline if the slot uses OpenRC.
+    """
+    bootloader_id = f"ObsidianOSslot{slot.upper()}"
+    _mount_slot_chroot(mount_dir, device, slot)
+    try:
+        grub_cmd = "grub2-install" if use_grub2 else "grub-install"
+        mkconfig_cmd = "grub2-mkconfig" if use_grub2 else "grub-mkconfig"
+        _chroot(mount_dir, f"{grub_cmd} --target=x86_64-efi --efi-directory=/efi --bootloader-id={bootloader_id}")
+        # Only slot A handles os-prober config (slot B inherits from rsync).
+        if slot == "a":
+            _chroot(mount_dir, "sed -i 's|^#*GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=false|' /etc/default/grub")
+        # OpenRC needs init= explicitly on the kernel cmdline.
+        if not use_grub2 and _is_openrc_at(mount_dir):
+            run_command(
+                f"sed -i 's|^#*GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"init=/sbin/openrc-init\"|' "
+                f"{mount_dir}/etc/default/grub"
+            )
+        # grub-mkconfig writes to /boot/grub/grub.cfg on the rootfs. The ESP
+        # only needs the EFI binary (placed by grub-install above); the real
+        # grub.cfg lives on root and is found via UUID at boot.
+        run_command(f"umount {mount_dir}/efi")
+        if use_grub2:
+            run_command(f"mkdir -p {mount_dir}/efi/grub")
+        else:
+            run_command(f"mkdir -p {mount_dir}/boot/grub")
+        _chroot(mount_dir, f"{mkconfig_cmd} -o /boot/grub/grub.cfg")
+    finally:
+        run_command(f"umount -R {mount_dir}", check=False)
+
+
+def _install_systemdboot_to_esp(esp_part, slot_letter):
+    """Install systemd-boot's EFI binary to the given ESP partition."""
+    mount_point = f"/mnt/obsidian_esp_{slot_letter}"
+    def _do():
+        run_command(
+            f'bootctl --esp-path={mount_point} '
+            f'--efi-boot-option-description="ObsidianOS (Slot {slot_letter.upper()})" install'
+        )
+    _with_temp_mount(esp_part, mount_point, _do, cleanup_dir=True)
+
+
+def _write_systemdboot_config_to_esp(esp_part, slot_letter, loader_conf, entry_a, entry_b):
+    """Write loader.conf and both slot entries to a given ESP."""
+    mount_point = f"/mnt/obsidian_esp_{slot_letter}_config"
+    def _do():
+        run_command(f"mkdir -p {mount_point}/loader/entries")
+        with open(f"{mount_point}/loader/loader.conf", "w") as f:
+            f.write(loader_conf)
+        with open(f"{mount_point}/loader/entries/obsidian-a.conf", "w") as f:
+            f.write(entry_a)
+        with open(f"{mount_point}/loader/entries/obsidian-b.conf", "w") as f:
+            f.write(entry_b)
+    _with_temp_mount(esp_part, mount_point, _do, cleanup_dir=True)
+
+
 def handle_mkobsidiansfs(args):
     _, ext = os.path.splitext(args.system_sfs)
     is_gentoo = ext == ".mkobsfs-gentoo"
@@ -162,29 +279,30 @@ label: gpt
     run_command(f"mount {lordo('root_a', device)} {mount_dir}")
     print(f"Extracting system from {system_sfs} to slot 'a'...")
     run_command(f"unsquashfs -f -d {mount_dir} -no-xattrs {system_sfs}")
+    run_command(f"mount --bind {mount_dir} {mount_dir}")
     print("Generating fstab for slot 'a'...")
     # On OpenRC, /run is cleared at boot so /run/etc_ab needs to be created
-    # before localmount processes fstab. 
-    import os as _os
-    _is_openrc = _os.path.exists(f"{mount_dir}/sbin/openrc-init")
-    if _is_openrc:
-        _os.makedirs(f"{mount_dir}/etc/init.d", exist_ok=True)
+    # before localmount processes fstab.
+    if _is_openrc_at(mount_dir):
+        os.makedirs(f"{mount_dir}/etc/init.d", exist_ok=True)
         with open(f"{mount_dir}/etc/init.d/obsidian-mkmountpoints", "w") as _f:
-            _f.write("#!/sbin/openrc-run\ndescription=\"Create ObsidianOS mount points in /run\"\ndepend() {\n    before localmount\n    keyword -prefix\n}\nstart() {\n    mkdir -p /run/etc_ab\n}\n")
-        _os.chmod(f"{mount_dir}/etc/init.d/obsidian-mkmountpoints", 0o755)
-        _os.makedirs(f"{mount_dir}/etc/runlevels/sysinit", exist_ok=True)
+            _f.write(
+                "#!/sbin/openrc-run\n"
+                "description=\"Create ObsidianOS mount points in /run\"\n"
+                "depend() {\n"
+                "    before localmount\n"
+                "    keyword -prefix\n"
+                "}\n"
+                "start() {\n"
+                "    mkdir -p /run/etc_ab\n"
+                "}\n"
+            )
+        os.chmod(f"{mount_dir}/etc/init.d/obsidian-mkmountpoints", 0o755)
+        os.makedirs(f"{mount_dir}/etc/runlevels/sysinit", exist_ok=True)
         _dst = f"{mount_dir}/etc/runlevels/sysinit/obsidian-mkmountpoints"
-        if not _os.path.exists(_dst):
-            _os.symlink("/etc/init.d/obsidian-mkmountpoints", _dst)
-    fstab_content_a = f"""
-{lordo('root_a', device)}  /      {fstype}  defaults,noatime 0 1
-{lordo('ESP_A', device)}   /efi  vfat  defaults,noatime 0 2
-{lordo('etc_ab', device)}  /run/etc_ab   {fstype}  defaults,noatime 0 2
-{lordo('var_ab', device)}  /var   {fstype}  defaults,noatime 0 2
-{lordo('home_ab', device)} /home  {fstype}  defaults,noatime 0 2
-"""
-    with open(f"{mount_dir}/etc/fstab", "w") as f:
-        f.write(fstab_content_a.strip())
+        if not os.path.exists(_dst):
+            os.symlink("/etc/init.d/obsidian-mkmountpoints", _dst)
+    _write_fstab(f"{mount_dir}/etc/fstab", device, fstype, "a")
 
     print("Populating shared /etc, /var, and /home partitions...")
     for part_label in ["etc_ab", "var_ab", "home_ab"]:
@@ -198,38 +316,27 @@ label: gpt
             run_command(f"umount {tmp_mount_dir}", check=False)
             run_command(f"rmdir {tmp_mount_dir}", check=False)
 
-    print("Populating ESP with boot files from system image...")
-    esp_tmp_mount = "/mnt/obsidian_esp_tmp"
-    run_command(f"mkdir -p {esp_tmp_mount}")
-    try:
-        run_command(f"mount {lordo('ESP_A', device)} {esp_tmp_mount}")
-        run_command(f"rsync -aK --delete {mount_dir}/boot/ {esp_tmp_mount}/")
-    finally:
-        run_command(f"umount {esp_tmp_mount}", check=False)
-        run_command(f"rmdir {esp_tmp_mount}", check=False)
-
-    print("Populating ESP_B with boot files from system image...")
-    esp_b_tmp_mount = "/mnt/obsidian_esp_b_tmp"
-    run_command(f"mkdir -p {esp_b_tmp_mount}")
-    try:
-        run_command(f"mount {lordo('ESP_B', device)} {esp_b_tmp_mount}")
-        run_command(f"rsync -aK --delete {mount_dir}/boot/ {esp_b_tmp_mount}/")
-    finally:
-        run_command(f"umount {esp_b_tmp_mount}", check=False)
-        run_command(f"rmdir {esp_b_tmp_mount}", check=False)
+    # The ESP gets only the GRUB EFI stub (placed by grub-install later).
+    # grub-install runs with --efi-directory=/efi --boot-directory=/boot
+    # (default), so grub.cfg + GRUB modules + kernel/initramfs live on the
+    # rootfs. At boot, grubx64.efi resolves the rootfs by UUID and reads
+    # everything from there — it never reads kernel files from the ESP.
+    # Old code rsynced /boot/ contents to each ESP; removed as dead weight
+    # (saved ~100 MiB per ESP and eliminated the "which kernel is real?"
+    # confusion on kernel upgrades).
 
     print("Mounting shared partitions for potential chroot...")
-    mount_commands = [
-        f"mkdir -p {mount_dir}/efi",
-        f"mkdir -p {mount_dir}/etc",
-        f"mkdir -p {mount_dir}/var",
-        f"mkdir -p {mount_dir}/home",
+    # NOTE: root_a is already mounted at mount_dir (line above). Mount the
+    # other 4 partitions for chroot use; don't use _mount_slot_chroot here
+    # because that would try to remount root_a on top of itself.
+    for sub in ("efi", "etc", "var", "home"):
+        run_command(f"mkdir -p {mount_dir}/{sub}")
+    for cmd in [
         f"mount {lordo('ESP_A', device)} {mount_dir}/efi",
         f"mount {lordo('etc_ab', device)} {mount_dir}/run/etc_ab --mkdir",
         f"mount {lordo('var_ab', device)} {mount_dir}/var",
         f"mount {lordo('home_ab', device)} {mount_dir}/home",
-    ]
-    for cmd in mount_commands:
+    ]:
         run_command(cmd)
 
     print("Copying support files to slot 'a'...")
@@ -299,102 +406,23 @@ label: gpt
     run_command(f"e2label {part4} root_b")
     print("Correcting fstab for slot 'b'...")
     mount_b_dir = "/mnt/obsidian_install_b"
-    run_command(f"mkdir -p {mount_b_dir}")
-    try:
-        run_command(f"mount {part4} {mount_b_dir}")
-        fstab_b_path = f"{mount_b_dir}/etc/fstab"
-        if not os.path.exists(os.path.dirname(fstab_b_path)):
-            run_command(f"mkdir -p {os.path.dirname(fstab_b_path)}")
-        with open(fstab_b_path, "w") as f:
-            f.write(f"""
-{lordo('root_b', device)}  /      {fstype}  defaults,noatime 0 1
-{lordo('ESP_B', device)}   /efi  vfat  defaults,noatime 0 2
-{lordo('etc_ab', device)}  /run/etc_ab   {fstype}  defaults,noatime 0 2
-{lordo('var_ab', device)}  /var   {fstype}  defaults,noatime 0 2
-{lordo('home_ab', device)} /home  {fstype}  defaults,noatime 0 2
-""")
-    finally:
-        run_command(f"umount {mount_b_dir}", check=False)
-        run_command(f"rm -r {mount_b_dir}", check=False)
+    def _do_slot_b_fstab():
+        _write_fstab(f"{mount_b_dir}/etc/fstab", device, fstype, "b")
+    _with_temp_mount(part4, mount_b_dir, _do_slot_b_fstab, cleanup_dir=False)
+    run_command(f"rm -r {mount_b_dir}", check=False)
 
     if not args.use_systemdboot:
-        mount_dir="/mnt/obsidianos-install-grub"
-        print("Installing GRUB to ESP_A...")
+        mount_dir = "/mnt/obsidianos-install-grub"
         run_command(f"mkdir -p {mount_dir}")
-        mount_commands = [
-            f"mount {lordo('root_a', device)} {mount_dir}/",
-            f"mount {lordo('ESP_A', device)} {mount_dir}/efi",
-            f"mount {lordo('etc_ab', device)} {mount_dir}/run/etc_ab --mkdir",
-            f"mount {lordo('var_ab', device)} {mount_dir}/var",
-            f"mount {lordo('home_ab', device)} {mount_dir}/home",
-        ]
-        for cmd in mount_commands:
-            run_command(cmd)
-        if args.use_grub2:
-            _chroot(mount_dir, "grub2-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=ObsidianOSslotA")
-            _chroot(mount_dir, "sed -i 's|^#*GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=false|' /etc/default/grub")
-            run_command(f"umount {mount_dir}/efi")
-            run_command(f"mkdir {mount_dir}/efi/grub/ -p")
-            _chroot(mount_dir, "grub2-mkconfig -o /boot/grub/grub.cfg")
-        else:
-            _chroot(mount_dir, "grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=ObsidianOSslotA")
-            _chroot(mount_dir, "sed -i 's|^#*GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=false|' /etc/default/grub")
-            # Detect OpenRC and set init=/sbin/openrc-init in kernel cmdline
-            import os as _os
-            _is_openrc = _os.path.exists(f"{mount_dir}/sbin/openrc-init")
-            if _is_openrc:
-                run_command(f"sed -i 's|^#*GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"init=/sbin/openrc-init\"|' {mount_dir}/etc/default/grub")
-            run_command(f"umount {mount_dir}/efi")
-            run_command(f"mkdir -p {mount_dir}/boot/grub")
-            _chroot(mount_dir, "grub-mkconfig -o /boot/grub/grub.cfg")
-        run_command(f"umount -R {mount_dir}")
-        mount_commands = [
-            f"mount {lordo('root_b', device)} {mount_dir}/",
-            f"mount {lordo('ESP_B', device)} {mount_dir}/efi",
-            f"mount {lordo('etc_ab', device)} {mount_dir}/run/etc_ab --mkdir",
-            f"mount {lordo('var_ab', device)} {mount_dir}/var",
-            f"mount {lordo('home_ab', device)} {mount_dir}/home",
-        ]
-        for cmd in mount_commands:
-            run_command(cmd)
-        if args.use_grub2:
-            _chroot(mount_dir, "grub2-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=ObsidianOSslotB")
-            run_command(f"umount {mount_dir}/efi")
-            run_command(f"mkdir {mount_dir}/efi/grub/ -p")
-            _chroot(mount_dir, "grub2-mkconfig -o /boot/grub/grub.cfg")
-        else:
-            _chroot(mount_dir, "grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=ObsidianOSslotB")
-            # Detect OpenRC and set init=/sbin/openrc-init in kernel cmdline
-            import os as _os
-            _is_openrc = _os.path.exists(f"{mount_dir}/sbin/openrc-init")
-            if _is_openrc:
-                run_command(f"sed -i 's|^#*GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"init=/sbin/openrc-init\"|' {mount_dir}/etc/default/grub")
-            run_command(f"umount {mount_dir}/efi")
-            run_command(f"mkdir -p {mount_dir}/boot/grub")
-            _chroot(mount_dir, "grub-mkconfig -o /boot/grub/grub.cfg")
-        run_command(f"umount -R {mount_dir}")
+        print("Installing GRUB to ESP_A...")
+        _install_grub_to_slot(mount_dir, device, "a", args.use_grub2)
+        print("Installing GRUB to ESP_B...")
+        _install_grub_to_slot(mount_dir, device, "b", args.use_grub2)
     else:
         print("Installing systemd-boot to ESP_A...")
-        esp_a_mount_dir = "/mnt/obsidian_esp_a"
-        run_command(f"mkdir -p {esp_a_mount_dir}")
-        try:
-            run_command(f"mount {part1} {esp_a_mount_dir}")
-            run_command(
-                f'bootctl --esp-path={esp_a_mount_dir} --efi-boot-option-description="ObsidianOS (Slot A)" install'
-            )
-        finally:
-            run_command(f"umount {esp_a_mount_dir}", check=False)
-            run_command(f"rm -r {esp_a_mount_dir}", check=False)
-
+        _install_systemdboot_to_esp(part1, "a")
         print("Installing systemd-boot to ESP_B...")
-        esp_b_mount_dir = "/mnt/obsidian_esp_b"
-        run_command(f"mkdir -p {esp_b_mount_dir}")
-        try:
-            run_command(f"mount {part2} {esp_b_mount_dir}")
-            run_command(f'bootctl --esp-path={esp_b_mount_dir} --efi-boot-option-description="ObsidianOS (Slot B)" install')
-        finally:
-            run_command(f"umount {esp_b_mount_dir}", check=False)
-            run_command(f"rm -r {esp_b_mount_dir}", check=False)
+        _install_systemdboot_to_esp(part2, "b")
 
         root_a_partuuid = run_command(
             f"blkid -s PARTUUID -o value {part3}", capture_output=True, text=True
@@ -409,54 +437,27 @@ label: gpt
             )
             sys.exit(1)
 
-        loader_conf = """
-timeout 0
-default obsidian-a.conf
-"""
-        entry_a_conf = f"""
-title ObsidianOS (Slot A)
-linux /vmlinuz-linux
-initrd /initramfs-linux.img
-options root=PARTUUID={root_a_partuuid} rw
-"""
-        entry_b_conf = f"""
-title ObsidianOS (Slot B)
-linux /vmlinuz-linux
-initrd /initramfs-linux.img
-options root=PARTUUID={root_b_partuuid} rw
-"""
+        loader_conf = "timeout 0\ndefault obsidian-a.conf\n"
+        entry_a_conf = (
+            "title ObsidianOS (Slot A)\n"
+            "linux /vmlinuz-linux\n"
+            "initrd /initramfs-linux.img\n"
+            f"options root=PARTUUID={root_a_partuuid} rw\n"
+        )
+        entry_b_conf = (
+            "title ObsidianOS (Slot B)\n"
+            "linux /vmlinuz-linux\n"
+            "initrd /initramfs-linux.img\n"
+            f"options root=PARTUUID={root_b_partuuid} rw\n"
+        )
 
-        esp_a_config_mount_dir = "/mnt/obsidian_esp_a_config"
-        run_command(f"mkdir -p {esp_a_config_mount_dir}")
-        try:
-            run_command(f"mount {part1} {esp_a_config_mount_dir}")
-            run_command(f"mkdir -p {esp_a_config_mount_dir}/loader/entries")
-            with open(f"{esp_a_config_mount_dir}/loader/loader.conf", "w") as f:
-                f.write(loader_conf)
-            with open(f"{esp_a_config_mount_dir}/loader/entries/obsidian-a.conf", "w") as f:
-                f.write(entry_a_conf)
-            with open(f"{esp_a_config_mount_dir}/loader/entries/obsidian-b.conf", "w") as f:
-                f.write(entry_b_conf)
-        finally:
-            run_command(f"umount {esp_a_config_mount_dir}", check=False)
-            run_command(f"rm -r {esp_a_config_mount_dir}", check=False)
-
+        print("Writing boot configuration to ESP_A...")
+        _write_systemdboot_config_to_esp(part1, "a", loader_conf, entry_a_conf, entry_b_conf)
         print("Writing boot configuration to ESP_B...")
-        esp_b_config_mount_dir = "/mnt/obsidian_esp_b_config"
-        run_command(f"mkdir -p {esp_b_config_mount_dir}")
-        try:
-            run_command(f"mount {part2} {esp_b_config_mount_dir}")
-            run_command(f"mkdir -p {esp_b_config_mount_dir}/loader/entries")
-            with open(f"{esp_b_config_mount_dir}/loader/loader.conf", "w") as f:
-                f.write(loader_conf)
-            with open(f"{esp_b_config_mount_dir}/loader/entries/obsidian-a.conf", "w") as f:
-                f.write(entry_a_conf)
-            with open(f"{esp_b_config_mount_dir}/loader/entries/obsidian-b.conf", "w") as f:
-                f.write(entry_b_conf)
-        finally:
-            run_command(f"umount {esp_b_config_mount_dir}", check=False)
-            run_command(f"rm -r {esp_b_config_mount_dir}", check=False)
-            run_command(f"rm -r {mount_dir}", check=False)
+        _write_systemdboot_config_to_esp(part2, "b", loader_conf, entry_a_conf, entry_b_conf)
+        # Old code unconditionally rm'd {mount_dir} here. mount_dir was the
+        # GRUB-install scratch dir which isn't created on the systemd-boot path,
+        # so the rm was a no-op or error. Removed.
     print("\nInstallation complete!")
     print("Default boot order will attempt Slot A, then Slot B.")
     print("Reboot your system to apply changes.")
